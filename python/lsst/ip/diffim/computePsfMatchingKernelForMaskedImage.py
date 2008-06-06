@@ -230,6 +230,39 @@ def computePsfMatchingKernelForMaskedImage(kernelFunctionPtr, backgroundFunction
     # In the end we want to test if the kernelInBasisList is Delta Functions; if so, do PCA
     # For DC2 we just do it
     kernelOutBasisList = diffimLib.computePcaKernelBasis(diffImContainerList, policy)
+
+    # Implemented in ticket 355 : ensure spatial conservation of kernel integral
+    conserveKernelIntegral = policy.get('computePsfMatchingKernelForMaskedImage').get('conserveKernelIntegral')
+    if conserveKernelIntegral:
+        # kernelOutBasisList[0] = mean kernel
+        # kernelOutBasisList[i] = PCA kernels
+        # Normalize each PCA kernel to have unit integral
+        # Then subtract off kernelOutBasisList[1] from kernelOutBasisList[2..N-1]
+        # The coefficiencts become a' = a * integral(K) - a1 * integral(K1)
+
+        kernelOutBasisList2 = afwMath.LinearCombinationKernelPtr()
+        kImage1 = afwImage.ImageD(kernelCols, kernelRows)
+        kImagei = afwImage.ImageD(kernelCols, kernelRows)
+
+        for kernelID, iKernelPtr in enumerate(kernelOutBasisList):
+            if kernelID == 0:
+                # mean kernel; append to new list and move on
+                kernelOutBasisList2.append(iKernelPtr)
+                continue
+            
+            if kernelID == 1:
+                # the kernel we will be subtracting off
+                kSum1    = ikernelPtr.computeImage(kImage1, 0, 0, False)
+            else:
+                kSumi    = ikernelPtr.computeImage(kImagei, 0, 0, False)
+                kImagei -= kImage1
+                kernelOutBasisList2.append( (Kernel(kImagei)) )
+
+            for containerID, iContainerPtr in enumerate(diffImContainerList):
+                
+            
+        
+        
     
     kernelPtr = diffimLib.computeSpatiallyVaryingPsfMatchingKernel(
         kernelFunctionPtr,

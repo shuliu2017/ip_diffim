@@ -182,6 +182,119 @@ class GetCoaddAsTemplateTask(pipeBase.Task):
         return pipeBase.Struct(exposure=coaddExposure,
                                sources=None)
 
+    def assembleTemplateExposure(self, butlerQC, skyMapRef, coaddExposureRefs, exposure):
+        """Assemble the template exposure from the coadd patches that are received
+        as inputs. Only one tract is supported.
+
+        Parameters
+        ----------
+        butlerQC : `lsst.pipe.base.ButlerQuantumContext`
+            Butler like object that supports getting data by DataseRef.
+
+        skyMapRef : `lsst.daf.butler.DatasetRef`
+            Reference to the SkyMap object that corresponds to the template coadd.
+
+        coaddExposureRefs : iterable of `lsst.daf.butler.DatasetRef`
+            Iterable of references to the available template coadd patches.
+
+        exposure : `lsst.afw.image.Exposure`
+            The science exposure to define the sky region of the template coadd.
+
+        Notes
+        -----
+        The closest tract is selected from the skymap; multiple tracts are not
+        supported. The assembled template inherits the WCS of the selected
+        skymap tract and the resolution of the template exposures. Overlapping
+        box regions of the input template patches are pixel by pixel copied
+        into the assembled template image. There is no warping or pixel resampling.
+
+        Pixels with no overlap of any available input patches are set to ``nan`` value
+        and ``NO_DATA`` flagged.
+
+        Returns
+        -------
+        exposure: `lsst.afw.image.ExposureF`
+            The stiched template coadd exposure.
+
+        """
+        skyMap = butlerQC.get(skyMapRef)
+        expWcs = exposure.getWcs()
+        expBoxD = geom.Box2D(exposure.getBBox())
+        expBoxD.grow(self.config.templateBorderSize)
+        ctrSkyPos = expWcs.pixelToSky(expBoxD.getCenter())
+
+        tractInfo = skyMap.findTract(ctrSkyPos)
+        skyCorners = [expWcs.pixelToSky(pixPos) for pixPos in expBoxD.getCorners()]
+        patchList = tractInfo.findPatchList(skyCorners)
+        patchDict = dict(
+            (tractInfo.getSequentialPatchIndex(p), p) for p in patchList
+        )
+        self.log.debug("Considering patches: %s" % str(patchList))
+
+        # compute coadd bbox
+        coaddWcs = tractInfo.getWcs()
+        coaddBBox = geom.Box2D()
+        for skyPos in skyCorners:
+            coaddBBox.include(coaddWcs.skyToPixel(skyPos))
+        coaddBBox = geom.Box2I(coaddBBox)
+        self.log.info("exposure dimensions=%s; coadd dimensions=%s" %
+                      (exposure.getDimensions(), coaddBBox.getDimensions()))
+
+        # assemble coadd exposure from subregions of patches
+        coaddExposure = afwImage.ExposureF(coaddBBox, coaddWcs)
+        coaddExposure.maskedImage.set(np.nan, afwImage.Mask.getPlaneBitMask("NO_DATA"), np.nan)
+        nPatchesFound = 0
+        coaddFilter = None
+        coaddPsf = None
+        for coaddRef in coaddExposureRefs:
+            dataId = coaddRef.dataId
+            if dataId['tract'] == tractInfo.getId() and dataId['patch'] in patchDict:
+                patchInfo = patchDict[dataId['patch']]
+                self.log.info("Using template input tract=%s, patch=%s" %
+                              (tractInfo.getId(), dataId['patch']))
+            else:
+                # This input is not among the patches for consideration
+                continue
+
+            patchSubBBox = patchInfo.getOuterBBox()
+            patchSubBBox.clip(coaddBBox)
+            patchArgDict = dict(
+                datasetType=coaddRef.datasetType.name,
+                bbox=patchSubBBox,
+                tract=tractInfo.getId(),
+                patch="%s,%s" % (patchInfo.getIndex()[0], patchInfo.getIndex()[1]),
+                numSubfilters=self.config.numSubfilters,
+            )
+            if patchSubBBox.isEmpty():
+                self.log.info("skip tract=%(tract)s, patch=%(patch)s; no overlapping pixels" % patchArgDict)
+                continue
+
+            # if self.config.coaddName == 'dcr':
+            # TODO DM-22952
+            coaddPatch = butlerQC.get(coaddRef)
+            nPatchesFound += 1
+
+            overlapBox = coaddPatch.getBBox()
+            overlapBox.clip(coaddBBox)
+            coaddExposure.maskedImage.assign(coaddPatch.maskedImage[overlapBox], overlapBox)
+
+            if coaddFilter is None:
+                coaddFilter = coaddPatch.getFilter()
+
+            # Retrieve the PSF for this coadd tract, if not already retrieved
+            if coaddPsf is None and coaddPatch.hasPsf():
+                coaddPsf = coaddPatch.getPsf()
+
+        if nPatchesFound == 0:
+            raise RuntimeError("No patches found!")
+
+        if coaddPsf is None:
+            raise RuntimeError("No coadd Psf found!")
+
+        coaddExposure.setPsf(coaddPsf)
+        coaddExposure.setFilter(coaddFilter)
+        return coaddExposure
+
     def getCoaddDatasetName(self):
         """Return coadd name for given task config
 
@@ -266,3 +379,6 @@ class GetCalexpAsTemplateTask(pipeBase.Task):
         templateSources = butler.get(datasetType="src", dataId=templateId)
         return pipeBase.Struct(exposure=template,
                                sources=templateSources)
+
+    def assembleTemplateExposure(self, **kwargs):
+        raise NotImplementedError("Calexp template is not supported with gen3 middleware")

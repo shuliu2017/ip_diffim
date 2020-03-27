@@ -472,12 +472,35 @@ class ZogyTask(pipeBase.Task):
             R_hat = np.fft.fft2(im1)
             N_hat = np.fft.fft2(im2)
 
-            D_hat = Kr_hat * N_hat
+            D_hat_N = Kr_hat * N_hat
             D_hat_R = Kn_hat * R_hat
+            
+            sigR, sigN = self.sig1, self.sig2
+            Fr, Fn = self.Fr, self.Fn
+            Pr_hat2 = np.conj(preqs.Pr_hat) * preqs.Pr_hat
+            Pn_hat2 = np.conj(preqs.Pn_hat) * preqs.Pn_hat
+            
+            # calculate beta parameter 
+            for i in range(3):
+                D_N = np.fft.ifft2(D_hat_N)
+                D_N = np.fft.ifftshift(D_N.real)
+                D_R = np.fft.ifft2(D_hat_R)
+                D_R = np.fft.ifftshift(D_R.real)
+                
+                if i == 0:
+                    np.save('beta_distribution.npy', D_N/D_R)
+                beta = np.sum(D_N) / np.sum(D_R)
+                print(f'beta: {beta}')
+                new_deno = np.sqrt((sigN**2 * Fr**2 * Pr_hat2) + \
+                                   beta**2 * (sigR**2 * Fn**2 * Pn_hat2))
+                
+                D_hat_N = Fr * preqs.Pr_hat * N_hat / new_deno
+                D_hat_R = Fn * preqs.Pn_hat * R_hat / new_deno
+
             if not doAdd:
-                D_hat -= D_hat_R
+                D_hat = D_hat_N - beta * D_hat_R
             else:
-                D_hat += D_hat_R
+                D_hat = D_hat_N + beta * D_hat_R
 
             D = np.fft.ifft2(D_hat)
             D = np.fft.ifftshift(D.real) / preqs.Fd

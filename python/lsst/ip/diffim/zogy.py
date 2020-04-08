@@ -461,16 +461,92 @@ class ZogyTask(pipeBase.Task):
             Kn_hat = np.fft.fft2(Kn)
             Kr = _filterKernel(np.fft.ifft2(Kr_hat), ps)
             Kr_hat = np.fft.fft2(Kr)
+            
+        def translateMask(mask):
+            NUM_BITS = 18
+            TO_AND = 2**np.arange(NUM_BITS).reshape([1, NUM_BITS])
 
-        def processImages(im1, im2, doAdd=False):
+            x = mask.array 
+            xshape = list(x.shape)
+            x = x.reshape([-1, 1])
+
+            unpck = (x & TO_AND).astype(bool).reshape(xshape + [NUM_BITS])  # ditched the astype(int)
+
+            codes = mask.getMaskPlaneDict()
+            mask_dict = {} 
+            for k, v in codes.items(): 
+                mask_dict[k] = unpck[:, :, v]
+
+            new_mask  = mask_dict['BAD'] 
+            new_mask |= mask_dict['NO_DATA']
+            new_mask |= mask_dict['CR']
+            new_mask |= mask_dict['EDGE']
+            new_mask |= mask_dict['SAT']
+            new_mask |= mask_dict['UNMASKEDNAN']
+            new_mask |= mask_dict['REJECTED']
+            new_mask |= mask_dict['CLIPPED'] 
+            new_mask |= mask_dict['INTRP']
+            return new_mask
+        
+        def interpolate_data(image, mask):
+            from scipy.interpolate import griddata
+            """This function interpolates masked region of a 2D image.
+            """
+            data = np.ma.masked_array(image, mask=mask)
+            x = np.arange(0, image.shape[1])
+            y = np.arange(0, image.shape[0])
+            xx, yy = np.meshgrid(x,y)
+            x_ma = xx[~data.mask]
+            y_ma = yy[~data.mask]
+            new_data = data[~data.mask]
+            new_image = griddata(
+                (x_ma, y_ma), new_data.ravel(), (xx, yy), method='linear'
+                )
+            return new_image
+        
+        def array_growth(arr):
+            temp1 = np.roll(arr, 1, 0), 
+            temp2 = np.roll(arr, -1, 0),
+            temp3 = np.roll(arr, 1, 1)
+            temp4 = np.roll(arr, -1, 1),
+            temp5 = np.roll(np.roll(arr, 1, 0), 1, 1),
+            temp6 = np.roll(np.roll(arr, 1, 0), -1, 1),
+            temp7 = np.roll(np.roll(arr,-1, 0), 1, 1),
+            temp8 = np.roll(np.roll(arr,-1, 0), -1, 1)
+            new_mask =  arr + temp1 +  temp2 + temp3 + temp4 + temp5 + temp6 + temp7 + temp8
+            return new_mask.astype(bool)
+
+        def processImages(im1, im2, im1_var, im2_var, doAdd=False):
             # Some masked regions are NaN or infinite!, and FFTs no likey.
             im1[np.isinf(im1)] = np.nan
             im1[np.isnan(im1)] = np.nanmean(im1)
             im2[np.isinf(im2)] = np.nan
             im2[np.isnan(im2)] = np.nanmean(im2)
+            im1_var[np.isinf(im1_var)] = np.nan
+            im1_var[np.isnan(im1_var)] = np.nanmean(im1_var)
+            im2_var[np.isinf(im2_var)] = np.nan
+            im2_var[np.isnan(im2_var)] = np.nanmean(im2_var)
+            
+            
+            R_mask = translateMask(self.template.getMask())
+            N_mask = translateMask(self.science.getMask())
+            mask = np.logical_or(R_mask, N_mask)
+            mask_growth = array_growth(mask)
+            mask_inverse = (mask == False)
+            np.save('mask_growth', mask_growth)
+            
+            # im1 = interpolate_data(im1, mask)
+            # im2 = interpolate_data(im2, mask)
 
+            # im1[np.isinf(im1)] = np.nan
+            # im1[np.isnan(im1)] = np.nanmean(im1)
+            # im2[np.isinf(im2)] = np.nan
+            # im2[np.isnan(im2)] = np.nanmean(im2)
+            
             R_hat = np.fft.fft2(im1)
             N_hat = np.fft.fft2(im2)
+            R_var_hat = np.fft.fft2(im1_var)
+            N_var_hat = np.fft.fft2(im2_var)
 
             D_hat_N = Kr_hat * N_hat
             D_hat_R = Kn_hat * R_hat
@@ -481,41 +557,49 @@ class ZogyTask(pipeBase.Task):
             Pn_hat2 = np.conj(preqs.Pn_hat) * preqs.Pn_hat
             
             # calculate beta parameter 
-            for i in range(3):
+            for i in range(10):
                 D_N = np.fft.ifft2(D_hat_N)
                 D_N = np.fft.ifftshift(D_N.real)
                 D_R = np.fft.ifft2(D_hat_R)
                 D_R = np.fft.ifftshift(D_R.real)
                 
-                if i == 0:
-                    np.save('beta_distribution.npy', D_N/D_R)
-                beta = np.sum(D_N) / np.sum(D_R)
+                beta = np.sum(D_N[mask_inverse]) / np.sum(D_R[mask_inverse])
                 print(f'beta: {beta}')
                 new_deno = np.sqrt((sigN**2 * Fr**2 * Pr_hat2) + \
                                    beta**2 * (sigR**2 * Fn**2 * Pn_hat2))
                 
                 D_hat_N = Fr * preqs.Pr_hat * N_hat / new_deno
                 D_hat_R = Fn * preqs.Pn_hat * R_hat / new_deno
+            D_hat_N_var = Fr * preqs.Pr_hat * N_var_hat / new_deno
+            D_hat_R_var = Fn * preqs.Pn_hat * R_var_hat / new_deno
 
             if not doAdd:
                 D_hat = D_hat_N - beta * D_hat_R
+                
             else:
                 D_hat = D_hat_N + beta * D_hat_R
 
+            D_var_hat = D_hat_N_var + beta * D_hat_R_var
+
             D = np.fft.ifft2(D_hat)
             D = np.fft.ifftshift(D.real) / preqs.Fd
+            
+            D_var = np.fft.ifft2(D_var_hat)
+            D_var = np.fft.ifftshift(D_var.real) / preqs.Fd
 
             R = None
+            R_var = None
             if returnMatchedTemplate:
                 R = np.fft.ifft2(D_hat_R)
                 R = np.fft.ifftshift(R.real) / preqs.Fd
 
-            return D, R
+                R_var = np.fft.ifft2(D_hat_R_var)
+                R_var = np.fft.ifftshift(R_var.real) / preqs.Fd
+
+            return D, R, D_var, R_var
 
         # First do the image
-        D, R = processImages(self.im1, self.im2, doAdd=False)
-        # Do the exact same thing to the var images, except add them
-        D_var, R_var = processImages(self.im1_var, self.im2_var, doAdd=True)
+        D, R, D_var, R_var = processImages(self.im1, self.im2, self.im1_var, self.im2_var, doAdd=False)
 
         return pipeBase.Struct(D=D, D_var=D_var, R=R, R_var=R_var)
 
